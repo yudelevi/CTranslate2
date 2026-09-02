@@ -1,0 +1,78 @@
+name: aarch64 CUDA wheel
+
+on:
+  push:
+    branches: [aarch64-cuda]
+    paths:
+      - '.github/workflows/aarch64-cuda-wheel.yml'
+      - 'python/ctranslate2/version.py'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CUDA_ARCH_LIST: "9.0"
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install CUDA and OpenBLAS
+        run: |
+          curl -fsSL -O https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-8 cuda-cudart-dev-12-8 libcublas-dev-12-8 libcurand-dev-12-8 \
+            libopenblas-dev
+          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
+
+      - name: Build libctranslate2
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_CLI=OFF \
+            -DWITH_MKL=OFF -DWITH_OPENBLAS=ON -DWITH_RUY=ON -DOPENMP_RUNTIME=COMP \
+            -DWITH_CUDA=ON -DWITH_CUDNN=OFF -DCUDA_DYNAMIC_LOADING=ON \
+            -DCUDA_NVCC_FLAGS="-Xfatbin=-compress-all" \
+            -DCUDA_ARCH_LIST="${CUDA_ARCH_LIST}"
+          cmake --build build -j"$(nproc)"
+          sudo cmake --install build
+          sudo ldconfig
+
+      - name: Build wheel
+        working-directory: python
+        run: |
+          pip install -r install_requirements.txt
+          pip wheel . --no-deps -w wheelhouse
+
+      - name: Verify CUDA is compiled in
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          whl = glob.glob("python/wheelhouse/*.whl")[0]
+          zf = zipfile.ZipFile(whl)
+          libs = [n for n in zf.namelist() if n.endswith(".so") or ".so." in n]
+          blob = b"".join(zf.read(n) for n in libs)
+          assert b"libcublas.so.12" in blob, "no cuBLAS reference: built without CUDA"
+          print(whl, "OK: cuBLAS 12 reference present")
+          PY
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python -c "exec(open('python/ctranslate2/version.py').read()); print(__version__)")
+          tag="v${version}-aarch64-cu128-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" python/wheelhouse/*.whl \
+            --title "CTranslate2 ${version} aarch64 + CUDA 12.8" \
+            --notes "Unofficial aarch64 wheel, WITH_CUDA=ON, sbsa CUDA 12.8, CUDA_ARCH_LIST=${CUDA_ARCH_LIST}, dynamic loading. Upstream PyPI aarch64 wheels are CPU-only. Built on ubuntu-22.04-arm (glibc 2.35). Each build publishes a new tag; assets are never replaced."
