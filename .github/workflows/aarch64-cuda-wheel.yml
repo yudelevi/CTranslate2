@@ -52,7 +52,7 @@ jobs:
       - name: Build wheel
         working-directory: python
         run: |
-          pip install -r install_requirements.txt auditwheel
+          pip install -r install_requirements.txt auditwheel "patchelf>=0.17"
           pip wheel . --no-deps -w dist
           # pip wheel leaves libctranslate2 out of the wheel; bundle it, but keep the
           # CUDA libraries external since they are dlopened and already on the target box.
