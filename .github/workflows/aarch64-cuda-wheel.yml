@@ -17,8 +17,20 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc 2.35, matches boxes still on Ubuntu 22.04
+          - runner: ubuntu-22.04-arm
+            cuda_repo: ubuntu2204
+            plat: manylinux_2_35_aarch64
+          # glibc 2.39, for boxes on Ubuntu 24.04
+          - runner: ubuntu-24.04-arm
+            cuda_repo: ubuntu2404
+            plat: manylinux_2_39_aarch64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,7 +42,7 @@ jobs:
 
       - name: Install CUDA and OpenBLAS
         run: |
-          curl -fsSL -O https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
+          curl -fsSL -O https://developer.download.nvidia.com/compute/cuda/repos/${{ matrix.cuda_repo }}/sbsa/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -56,7 +68,7 @@ jobs:
           pip wheel . --no-deps -w dist
           # pip wheel leaves libctranslate2 out of the wheel; bundle it, but keep the
           # CUDA libraries external since they are dlopened and already on the target box.
-          auditwheel repair dist/*.whl --plat manylinux_2_35_aarch64 -w wheelhouse \
+          auditwheel repair dist/*.whl --plat ${{ matrix.plat }} -w wheelhouse \
             --exclude libcudart.so.12 \
             --exclude libcublas.so.12 \
             --exclude libcublasLt.so.12 \
@@ -84,6 +96,9 @@ jobs:
         run: |
           version=$(python -c "exec(open('python/ctranslate2/version.py').read()); print(__version__)")
           tag="v${version}-aarch64-cu128-${GITHUB_RUN_NUMBER}"
-          gh release create "$tag" python/wheelhouse/*.whl \
-            --title "CTranslate2 ${version} aarch64 + CUDA 12.8" \
-            --notes "Unofficial aarch64 wheel, WITH_CUDA=ON, sbsa CUDA 12.8, CUDA_ARCH_LIST=${CUDA_ARCH_LIST}, dynamic loading. Upstream PyPI aarch64 wheels are CPU-only. Built on ubuntu-22.04-arm (glibc 2.35). Each build publishes a new tag; assets are never replaced."
+          # One release per run holds both glibc variants; whichever job gets
+          # there first creates the tag and the other uploads alongside it.
+          gh release create "$tag" --title "CTranslate2 ${version} aarch64 + CUDA 12.8" \
+            --notes "Unofficial aarch64 wheels, WITH_CUDA=ON, sbsa CUDA 12.8, CUDA_ARCH_LIST=${CUDA_ARCH_LIST}, dynamic loading. Upstream PyPI aarch64 wheels are CPU-only. Built for glibc 2.35 (Ubuntu 22.04) and glibc 2.39 (Ubuntu 24.04). Each build publishes a new tag; assets are never replaced." \
+            || echo "release exists, uploading into it"
+          gh release upload "$tag" python/wheelhouse/*.whl --clobber
