@@ -52,8 +52,15 @@ jobs:
       - name: Build wheel
         working-directory: python
         run: |
-          pip install -r install_requirements.txt
-          pip wheel . --no-deps -w wheelhouse
+          pip install -r install_requirements.txt auditwheel
+          pip wheel . --no-deps -w dist
+          # pip wheel leaves libctranslate2 out of the wheel; bundle it, but keep the
+          # CUDA libraries external since they are dlopened and already on the target box.
+          auditwheel repair dist/*.whl --plat linux_aarch64 -w wheelhouse \
+            --exclude libcudart.so.12 \
+            --exclude libcublas.so.12 \
+            --exclude libcublasLt.so.12 \
+            --exclude libcurand.so.10
 
       - name: Verify CUDA is compiled in
         run: |
@@ -62,9 +69,13 @@ jobs:
           whl = glob.glob("python/wheelhouse/*.whl")[0]
           zf = zipfile.ZipFile(whl)
           libs = [n for n in zf.namelist() if n.endswith(".so") or ".so." in n]
+          print(whl)
+          for n in libs:
+              print("   ", n, zf.getinfo(n).file_size)
+          assert any("libctranslate2" in n for n in libs), "libctranslate2 not bundled"
           blob = b"".join(zf.read(n) for n in libs)
           assert b"libcublas.so.12" in blob, "no cuBLAS reference: built without CUDA"
-          print(whl, "OK: cuBLAS 12 reference present")
+          print("OK: libctranslate2 bundled, cuBLAS 12 reference present")
           PY
 
       - name: Publish release
