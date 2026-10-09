@@ -13,7 +13,7 @@ permissions:
 
 env:
   CUDA_ARCH_LIST: "9.0"
-  PYTHON_VERSION: "3.14"
+  PYTHON_VERSIONS: "3.14 3.15"
 
 jobs:
   build:
@@ -38,7 +38,10 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: |
+            3.14
+            3.15
+          allow-prereleases: true
 
       - name: Install CUDA and OpenBLAS
         run: |
@@ -61,32 +64,38 @@ jobs:
           sudo cmake --install build
           sudo ldconfig
 
-      - name: Build wheel
+      - name: Build wheels
         working-directory: python
         run: |
-          pip install -r install_requirements.txt auditwheel "patchelf>=0.17"
-          pip wheel . --no-deps -w dist
           # pip wheel leaves libctranslate2 out of the wheel; bundle it, but keep the
           # CUDA libraries external since they are dlopened and already on the target box.
-          auditwheel repair dist/*.whl --plat ${{ matrix.plat }} -w wheelhouse \
-            --exclude libcudart.so.12 \
-            --exclude libcublas.so.12 \
-            --exclude libcublasLt.so.12 \
-            --exclude libcurand.so.10
+          for py in ${PYTHON_VERSIONS}; do
+            "python${py}" -m pip install -r install_requirements.txt auditwheel "patchelf>=0.17"
+            rm -rf build dist
+            "python${py}" -m pip wheel . --no-deps -w dist
+            "python${py}" -m auditwheel repair dist/*.whl --plat ${{ matrix.plat }} -w wheelhouse \
+              --exclude libcudart.so.12 \
+              --exclude libcublas.so.12 \
+              --exclude libcublasLt.so.12 \
+              --exclude libcurand.so.10
+          done
 
       - name: Verify CUDA is compiled in
         run: |
           python - <<'PY'
-          import glob, zipfile
-          whl = glob.glob("python/wheelhouse/*.whl")[0]
-          zf = zipfile.ZipFile(whl)
-          libs = [n for n in zf.namelist() if n.endswith(".so") or ".so." in n]
-          print(whl)
-          for n in libs:
-              print("   ", n, zf.getinfo(n).file_size)
-          assert any("libctranslate2" in n for n in libs), "libctranslate2 not bundled"
-          blob = b"".join(zf.read(n) for n in libs)
-          assert b"libcublas.so.12" in blob, "no cuBLAS reference: built without CUDA"
+          import glob, os, zipfile
+          wheels = sorted(glob.glob("python/wheelhouse/*.whl"))
+          for tag in ("cp" + v.replace(".", "") for v in os.environ["PYTHON_VERSIONS"].split()):
+              assert any(f"-{tag}-{tag}-" in w for w in wheels), f"no {tag} wheel"
+          for whl in wheels:
+              zf = zipfile.ZipFile(whl)
+              libs = [n for n in zf.namelist() if n.endswith(".so") or ".so." in n]
+              print(whl)
+              for n in libs:
+                  print("   ", n, zf.getinfo(n).file_size)
+              assert any("libctranslate2" in n for n in libs), "libctranslate2 not bundled"
+              blob = b"".join(zf.read(n) for n in libs)
+              assert b"libcublas.so.12" in blob, "no cuBLAS reference: built without CUDA"
           print("OK: libctranslate2 bundled, cuBLAS 12 reference present")
           PY
 
