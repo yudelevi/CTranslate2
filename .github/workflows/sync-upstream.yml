@@ -62,6 +62,8 @@ jobs:
         if: steps.merge.outputs.after != steps.merge.outputs.before
         env:
           GH_TOKEN: ${{ github.token }}
+          # gh picks the upstream remote added above unless the repo is pinned.
+          GH_REPO: ${{ github.repository }}
         run: |
           echo "version ${{ steps.merge.outputs.before }} -> ${{ steps.merge.outputs.after }}"
           gh workflow run aarch64-cuda-wheel.yml --ref aarch64-cuda
