@@ -30,24 +30,25 @@ jobs:
           echo "before=$before" >> "$GITHUB_OUTPUT"
 
           if ! git merge --no-commit --no-edit upstream/master; then
-            # This fork deliberately deletes upstream CI to avoid its publish jobs.
-            # Preserve that deletion when upstream modifies the workflow.
-            if [[ $(git status --porcelain -- .github/workflows/ci.yml) == 'DU .github/workflows/ci.yml' ]]; then
-              git rm -- .github/workflows/ci.yml
-            fi
-
-            if [[ -n $(git diff --name-only --diff-filter=U) ]]; then
-              echo "::error::Upstream merge has conflicts that require manual resolution:"
-              git diff --name-only --diff-filter=U
-              git merge --abort
-              exit 1
-            fi
-
             # A failed merge without MERGE_HEAD is an operational error, not a conflict.
             if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
               echo "::error::Upstream merge failed before a merge could be prepared."
               exit 1
             fi
+          fi
+
+          # This fork deliberately drops upstream workflows (their publish jobs), and
+          # GITHUB_TOKEN cannot push workflow changes, so keep only workflows we own.
+          comm -13 \
+            <(git ls-tree --name-only HEAD .github/workflows/ | LC_ALL=C sort) \
+            <(git ls-files .github/workflows/ | LC_ALL=C sort -u) \
+            | xargs -r git rm -q -f --
+
+          if [[ -n $(git diff --name-only --diff-filter=U) ]]; then
+            echo "::error::Upstream merge has conflicts that require manual resolution:"
+            git diff --name-only --diff-filter=U
+            git merge --abort
+            exit 1
           fi
 
           if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
