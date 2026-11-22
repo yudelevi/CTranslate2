@@ -108,7 +108,7 @@ _TRANSFORMERS_TRANSLATION_TESTS = [
         "▁Es ▁ist ▁in ▁den ▁süd amerikanische n ▁And en ▁ver breite t ▁und "
         "▁eine ▁vom ▁Guan ako ▁ab sta mmende ▁ Haustier form . </s>",
         "",
-        "▁Was ▁ist ▁ein ▁Lama - L ama ?",
+        "▁Was ▁ist ▁Lama ▁glam a ?",
         dict(),
     ),
     (
@@ -144,6 +144,11 @@ def test_transformers_translation(
     expected_tokens,
     kwargs,
 ):
+    if "t5gemma-2" in model:
+        transformers = pytest.importorskip("transformers")
+        if not hasattr(transformers, "T5Gemma2ForConditionalGeneration"):
+            pytest.skip("T5Gemma2 is not available in this Transformers version")
+
     converter = ctranslate2.converters.TransformersConverter(model)
     output_dir = str(tmp_dir.join("ctranslate2_model"))
     output_dir = converter.convert(output_dir)
@@ -225,6 +230,13 @@ _TRANSFORMERS_GENERATION_TESTS = [
         50,
         "<|im_start|> user Ċ What Ġis Ġthe Ġcapital Ġof ĠPortugal ? Ġ/ no _th ink Ċ <|im_end|> Ċ "
         "<|im_start|> assistant Ċ <think> ĊĊ </think> ĊĊ The Ġcapital Ġof ĠPortugal Ġis ĠLisbon .",
+    ),
+    (
+        "EleutherAI/pythia-14m",
+        "The Ġcapital Ġof ĠFrance Ġis",
+        20,
+        "The Ġcapital Ġof ĠFrance Ġis Ġthe ĠUnited ĠStates . Ċ Ċ The Ġcapital Ġof "
+        "ĠFrance Ġis Ġthe Ġfirst Ġcity Ġof ĠParis",
     ),
 ]
 
@@ -312,6 +324,7 @@ def test_transformers_marianmt_disable_unk(
         "distilbert-base-uncased",
         "distilbert-base-cased-distilled-squad",
         "typeform/distilbert-base-uncased-mnli",
+        "almanach/camembert-base",
     ],
 )
 def test_transformers_encoder(clear_transformers_cache, tmp_dir, device, model_name):
@@ -944,6 +957,97 @@ class TestWhisper:
         )
 
     @test_utils.only_on_linux
+    @test_utils.require_cuda
+    @pytest.mark.parametrize(
+        "test_names", [["jfk"], ["mr_quilter", "jfk"]], ids=["single", "batch"]
+    )
+    def test_transformers_whisper_encoder_flash_attn(self, tmp_dir, test_names):
+        import transformers
+
+        audios = []
+
+        test_dir = os.path.join(test_utils.get_data_dir(), "audio")
+
+        for name in test_names:
+            audio_path = os.path.join(test_dir, "%s.npy" % name)
+            audios.append(np.load(audio_path))
+
+        model_name = "openai/whisper-tiny"
+        converter = ctranslate2.converters.TransformersConverter(model_name)
+        output_dir = str(tmp_dir.join("ctranslate2_model"))
+        output_dir = converter.convert(output_dir)
+
+        processor = transformers.WhisperProcessor.from_pretrained(model_name)
+
+        def _get_features(audio):
+            # Pad after computing the log-Mel spectrogram to match the openai/whisper behavior.
+            inputs = processor(audio, padding=False, sampling_rate=16000)
+            features = inputs.input_features[0]
+            features = np.pad(features, [(0, 0), (0, 3000 - features.shape[-1])])
+            return features
+
+        features = np.stack(list(map(_get_features, audios)))
+        features = ctranslate2.StorageView.from_array(features)
+
+        model = ctranslate2.models.Whisper(
+            output_dir, device="cuda", flash_attention=False, compute_type="float16"
+        )
+        try:
+            model_flash_attn = ctranslate2.models.Whisper(
+                output_dir, device="cuda", flash_attention=True, compute_type="float16"
+            )
+        except ValueError as e:
+            if "only supports Ampere" not in str(e):
+                raise
+            pytest.skip(
+                "Flash attention requires a GPU with compute capability 8.0 or newer"
+            )
+
+        encoder_output = model.encode(features)
+        try:
+            encoder_output_flash_attn = model_flash_attn.encode(features)
+        except RuntimeError as e:
+            if "Flash attention 2 is not supported" not in str(e):
+                raise
+            pytest.skip("CTranslate2 was built without flash attention")
+
+        encoder_output = _to_numpy(encoder_output, "cuda")
+        encoder_output_flash_attn = _to_numpy(encoder_output_flash_attn, "cuda")
+
+        # 3000 log-Mel frames are halved by the stride-2 convolution; 384 is the
+        # hidden size of whisper-tiny.
+        expected_shape = (len(test_names), 1500, 384)
+        assert encoder_output.shape == expected_shape, (
+            f"Encoder output without flash attention has shape {encoder_output.shape}, "
+            f"expected {expected_shape}."
+        )
+        assert encoder_output_flash_attn.shape == expected_shape, (
+            f"Encoder output with flash attention has shape {encoder_output_flash_attn.shape}, "
+            f"expected {expected_shape}."
+        )
+        assert np.isfinite(
+            encoder_output
+        ).all(), "Encoder output without flash attention contains non-finite values (NaN or Inf)."
+        assert np.isfinite(
+            encoder_output_flash_attn
+        ).all(), "Encoder output with flash attention contains non-finite values (NaN or Inf)."
+
+        # The outputs would be bit-wise equal if the flash_attention option was ignored.
+        assert not np.array_equal(encoder_output, encoder_output_flash_attn), (
+            "Bit-wise equality between both encoder outputs indicates that the "
+            "flash_attention option is ignored by the encoder."
+        )
+
+        # FP16 noise between both paths was measured at ~1 (RTX PRO 6000), while
+        # causal masking in the encoder self-attention gives ~24.
+        # 5 separates both cases by geometric mean.
+        max_diff = np.max(np.abs(encoder_output - encoder_output_flash_attn), (-2, -1))
+        assert (max_diff < 5).all(), (
+            f"Max absolute difference per sample is {max_diff}. "
+            "This is larger than FP16 noise and indicates a wrong attention mask."
+        )
+
+    @test_utils.only_on_linux
     def test_transformers_whisper_partial_audio_context(self, tmp_dir):
         import transformers
 
@@ -1301,7 +1405,7 @@ def test_umt5_loader_keeps_one_relative_attention_bias_per_layer():
 #    `initializer_factor` is kept small to stay well-conditioned through the gated FFN.
 
 
-def _tiny_umt5_vocabulary(vocab_size):
+def _tiny_t5_vocabulary(vocab_size):
     return ["<pad>", "</s>", "<unk>"] + ["tok%d" % i for i in range(3, vocab_size)]
 
 
@@ -1381,9 +1485,12 @@ def _build_umt5_with_biases(
 def _save_umt5(model, output_dir):
     from ctranslate2.converters.transformers import UMT5Loader
 
-    loader = UMT5Loader()
+    return _save_t5_family_model(model, output_dir, UMT5Loader())
+
+
+def _save_t5_family_model(model, output_dir, loader):
     spec = loader.get_model_spec(model)
-    tokens = _tiny_umt5_vocabulary(model.config.vocab_size)
+    tokens = _tiny_t5_vocabulary(model.config.vocab_size)
     loader.set_vocabulary(spec, tokens)
     spec.config.bos_token = "<pad>"
     spec.config.eos_token = "</s>"
@@ -1415,7 +1522,7 @@ def _save_umt5_encoder(model, output_dir):
     spec = transformer_spec.TransformerEncoderModelSpec(encoder)
     UMT5Loader().set_stack(spec.encoder, model.encoder)
 
-    tokens = _tiny_umt5_vocabulary(config.vocab_size)
+    tokens = _tiny_t5_vocabulary(config.vocab_size)
     spec.register_vocabulary(tokens)
     spec.config.bos_token = "<pad>"
     spec.config.eos_token = "</s>"
@@ -1432,7 +1539,7 @@ _UMT5_SOURCE = [5, 9, 14, 23, 7, 33, 41, 18, 52, 11, 27, 6, 44, 30, 21, 38]
 _UMT5_TARGET = [11, 4, 19, 30, 27, 48, 13, 36, 8, 25, 55, 17, 42, 9, 31, 20]
 
 
-def _umt5_log_probs(model_dir, tokens, source, target):
+def _t5_log_probs(model_dir, tokens, source, target):
     translator = ctranslate2.Translator(
         model_dir,
         device="cpu",
@@ -1446,14 +1553,14 @@ def _umt5_log_probs(model_dir, tokens, source, target):
     return np.array(result.log_probs)
 
 
-def _umt5_reference_log_probs(model, source, target):
+def _t5_reference_log_probs(model, source, target):
     import torch
 
     # score_batch appends </s> to the target itself.
     target = target + [model.config.eos_token_id]
     with torch.no_grad():
         outputs = model(
-            input_ids=torch.tensor([source + [model.config.eos_token_id]]),
+            input_ids=torch.tensor([source]),
             decoder_input_ids=torch.tensor(
                 [[model.config.decoder_start_token_id] + target[:-1]]
             ),
@@ -1521,13 +1628,13 @@ def test_umt5_runtime_uses_per_layer_bias_in_decoder(tmp_dir):
     tokens = _save_umt5(distinct, str(tmp_dir.join("distinct")))
     _save_umt5(shared, str(tmp_dir.join("shared")))
 
-    got_distinct = _umt5_log_probs(
+    got_distinct = _t5_log_probs(
         str(tmp_dir.join("distinct")), tokens, _UMT5_SOURCE, _UMT5_TARGET
     )
-    got_shared = _umt5_log_probs(
+    got_shared = _t5_log_probs(
         str(tmp_dir.join("shared")), tokens, _UMT5_SOURCE, _UMT5_TARGET
     )
-    expected = _umt5_reference_log_probs(distinct, _UMT5_SOURCE, _UMT5_TARGET)
+    expected = _t5_reference_log_probs(distinct, _UMT5_SOURCE, _UMT5_TARGET)
 
     assert np.abs(got_distinct - expected).max() < 1e-4
     assert np.abs(got_distinct - got_shared).max() > 1e-4
@@ -1540,12 +1647,37 @@ def test_umt5_runtime_matches_transformers_with_distinct_biases_in_both_stacks(t
     model = _build_umt5_with_biases(True, True, amplify_decoder_values=30.0)
     tokens = _save_umt5(model, str(tmp_dir.join("model")))
 
-    got = _umt5_log_probs(
-        str(tmp_dir.join("model")), tokens, _UMT5_SOURCE, _UMT5_TARGET
-    )
-    expected = _umt5_reference_log_probs(model, _UMT5_SOURCE, _UMT5_TARGET)
+    got = _t5_log_probs(str(tmp_dir.join("model")), tokens, _UMT5_SOURCE, _UMT5_TARGET)
+    expected = _t5_reference_log_probs(model, _UMT5_SOURCE, _UMT5_TARGET)
 
     assert np.abs(got - expected).max() < 1e-4
+
+
+@test_utils.only_on_linux
+@pytest.mark.parametrize("architecture", ["T5", "MT5"])
+@pytest.mark.parametrize("tie_word_embeddings", [False, True])
+def test_t5_decoder_output_scaling_matches_transformers(
+    architecture, tie_word_embeddings, tmp_dir
+):
+    import torch
+    import transformers
+
+    from ctranslate2.converters import transformers as converters
+
+    torch.manual_seed(0)
+    model = _build_tiny_t5_family_model(
+        getattr(transformers, architecture + "ForConditionalGeneration"),
+        getattr(transformers, architecture + "Config"),
+        tie_word_embeddings=tie_word_embeddings,
+        decoder_start_token_id=0,
+    )
+    loader = getattr(converters, architecture + "Loader")()
+    model_dir = str(tmp_dir.join("model"))
+    tokens = _save_t5_family_model(model, model_dir, loader)
+    source, target = [5, 9, 14], [11, 4, 19]
+    actual = _t5_log_probs(model_dir, tokens, source, target)
+    expected = _t5_reference_log_probs(model, source, target)
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-4)
 
 
 @test_utils.only_on_linux

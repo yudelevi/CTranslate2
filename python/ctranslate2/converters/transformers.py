@@ -1415,13 +1415,17 @@ class GPTNeoXLoader(ModelLoader):
         return "GPTNeoXForCausalLM"
 
     def get_model_spec(self, model):
+        rotary_pct = getattr(model.config, "rotary_pct", None)
+        if rotary_pct is None:
+            rotary_pct = model.config.rope_parameters["partial_rotary_factor"]
+
         spec = transformer_spec.TransformerDecoderModelSpec.from_config(
             model.config.num_hidden_layers,
             model.config.num_attention_heads,
             pre_norm=True,
             activation=_SUPPORTED_ACTIVATIONS[model.config.hidden_act],
             rotary_dim=int(
-                model.config.rotary_pct
+                rotary_pct
                 * (model.config.hidden_size // model.config.num_attention_heads)
             ),
             rotary_interleave=False,
@@ -1430,7 +1434,10 @@ class GPTNeoXLoader(ModelLoader):
         )
 
         self.set_decoder(spec.decoder, model.gpt_neox, model.config.num_attention_heads)
-        self.set_linear(spec.decoder.projection, model.embed_out)
+        self.set_linear(
+            spec.decoder.projection,
+            model.embed_out if hasattr(model, "embed_out") else model.lm_head,
+        )
         return spec
 
     def get_vocabulary(self, model, tokenizer):
@@ -1808,10 +1815,15 @@ class T5Loader(ModelLoader):
         self.set_stack(spec.decoder, model.decoder, is_decoder=True)
         self.set_linear(spec.decoder.projection, model.lm_head)
 
-        if model.config.tie_word_embeddings:
+        if self._scale_decoder_outputs(model.config):
             spec.decoder.scale_outputs = model.config.d_model**-0.5
 
         return spec
+
+    def _scale_decoder_outputs(self, config):
+        # Transformers 4 rescales when the word embeddings are tied. Transformers 5
+        # always sets tie_word_embeddings=True and decides with scale_decoder_outputs.
+        return getattr(config, "scale_decoder_outputs", config.tie_word_embeddings)
 
     def get_vocabulary(self, model, tokenizer):
         tokens = super().get_vocabulary(model, tokenizer)
@@ -1917,6 +1929,12 @@ class MT5Loader(T5Loader):
     @property
     def architecture_name(self):
         return "MT5ForConditionalGeneration"
+
+    def _scale_decoder_outputs(self, config):
+        # Transformers 4 rescales when the word embeddings are tied. Transformers 5
+        # never rescales mT5 outputs and always sets tie_word_embeddings=True.
+        transformers_major_version = int(transformers.__version__.split(".")[0])
+        return transformers_major_version < 5 and config.tie_word_embeddings
 
 
 @register_loader("UMT5Config")
@@ -2245,9 +2263,18 @@ class Gemma2Loader(ModelLoader):
             pre_post_layer_norm=True,
         )
 
+        # Queries are scaled by query_pre_attn_scalar, which differs from head_dim
+        # in Gemma 2 27B.
+        queries_scale = np.float32(model.config.query_pre_attn_scalar**-0.5)
+        for layer_spec in spec.decoder.layer:
+            layer_spec.self_attention.queries_scale = queries_scale
+
         self.set_decoder(spec.decoder, model.model)
         self.set_linear(spec.decoder.projection, model.lm_head)
         spec.decoder.embeddings.multiply_by_sqrt_depth = model.config.hidden_size**0.5
+        final_softcap = getattr(model.config, "final_logit_softcapping", None)
+        if final_softcap is not None and final_softcap > 0:
+            spec.decoder.final_logit_softcapping = np.float32(final_softcap)
         return spec
 
     def get_vocabulary(self, model, tokenizer):
@@ -2494,6 +2521,21 @@ class Gemma3Loader(ModelLoader):
         rope_local_base_freq = getattr(
             text_config, "rope_local_base_freq", 10_000
         )  # Local: 10k
+        rope_parameters = getattr(text_config, "rope_parameters", None) or {}
+        global_rope = rope_parameters.get("full_attention", {})
+        local_rope = rope_parameters.get("sliding_attention", {})
+        rope_theta = global_rope.get("rope_theta", rope_theta)
+        rope_local_base_freq = local_rope.get("rope_theta", rope_local_base_freq)
+        global_scaling = global_rope or getattr(text_config, "rope_scaling", None) or {}
+        global_rope_type = global_scaling.get(
+            "rope_type", global_scaling.get("type", "default")
+        )
+        if global_rope_type not in ("default", "linear"):
+            raise NotImplementedError(
+                "Unsupported Gemma 3 full-attention RoPE: %s" % global_rope_type
+            )
+        if local_rope.get("rope_type", "default") != "default":
+            raise NotImplementedError("Unsupported Gemma 3 sliding-attention RoPE")
 
         # Get sliding window configuration
         sliding_window = getattr(text_config, "sliding_window", 1024)
@@ -2556,12 +2598,24 @@ class Gemma3Loader(ModelLoader):
         # Store layer_types for use in set_decoder
         self._layer_types = layer_types
 
+        # Queries are scaled by query_pre_attn_scalar, which differs from head_dim
+        # in Gemma 3 27B.
+        queries_scale = np.float32(text_config.query_pre_attn_scalar**-0.5)
+
         # Override per-layer settings for global vs local attention
         for i, layer_type in enumerate(layer_types):
             layer = spec.decoder.layer[i]
+            layer.self_attention.queries_scale = queries_scale
             if layer_type == "full_attention":
                 layer.self_attention.rotary_base = np.dtype("float32").type(rope_theta)
                 layer.self_attention.sliding_window = np.dtype("int32").type(0)
+                if global_rope_type == "linear":
+                    layer.self_attention.rotary_scaling_type = np.int8(
+                        attention_spec.RotaryScalingType.Linear
+                    )
+                    layer.self_attention.rotary_scaling_factor = np.float32(
+                        global_scaling["factor"]
+                    )
             elif layer_type == "sliding_attention":
                 layer.self_attention.rotary_base = np.dtype("float32").type(
                     rope_local_base_freq
@@ -2573,6 +2627,9 @@ class Gemma3Loader(ModelLoader):
         text_model = getattr(model.model, "language_model", model.model)
         self.set_decoder(spec.decoder, text_model, quant_type)
         self.set_linear(spec.decoder.projection, model.lm_head)
+        final_softcap = getattr(text_config, "final_logit_softcapping", None)
+        if final_softcap is not None and final_softcap > 0:
+            spec.decoder.final_logit_softcapping = np.float32(final_softcap)
         return spec
 
     def get_vocabulary(self, model, tokenizer):
@@ -3542,16 +3599,18 @@ class Phi3Loader(ModelLoader):
             model.config, "original_max_position_embeddings", 0
         )
         max_position_embeddings = getattr(model.config, "max_position_embeddings", 0)
-        rope_scaling = getattr(model.config, "rope_scaling", None)
-        if rope_scaling:
-            rotary_scaling_type = _SUPPORTED_ROPE_SCALING.get(rope_scaling["type"])
+        # transformers 4.x: rope_scaling["type"]; 5.x: rope_parameters["rope_type"].
+        rope_scaling = getattr(model.config, "rope_scaling", None) or {}
+        rope_type = rope_scaling.get("type") or rope_scaling.get("rope_type")
+        if rope_type not in (None, "default"):
+            rotary_scaling_type = _SUPPORTED_ROPE_SCALING.get(rope_type)
             rotary_scaling_factor = rope_scaling.get("factor", 1)
 
             if rotary_scaling_type is None:
                 raise NotImplementedError(
                     "RoPE scaling type '%s' is not yet implemented. "
                     "The following RoPE scaling types are currently supported: %s"
-                    % (rope_scaling["type"], ", ".join(_SUPPORTED_ROPE_SCALING.keys()))
+                    % (rope_type, ", ".join(_SUPPORTED_ROPE_SCALING.keys()))
                 )
         else:
             rotary_scaling_type = None
@@ -3579,6 +3638,15 @@ class Phi3Loader(ModelLoader):
             quant_group_size = None
             quant_bits = None
 
+        # Phi-4-mini rotates only part of each head (5.x keeps the factor in rope_scaling).
+        partial_rotary_factor = getattr(
+            model.config, "partial_rotary_factor", None
+        ) or rope_scaling.get("partial_rotary_factor", 1.0)
+        head_dim = model.config.hidden_size // num_heads
+        rotary_dim = (
+            int(head_dim * partial_rotary_factor) if partial_rotary_factor < 1 else 0
+        )
+
         spec = transformer_spec.TransformerDecoderModelSpec.from_config(
             num_layers,
             num_heads,
@@ -3586,11 +3654,12 @@ class Phi3Loader(ModelLoader):
             pre_norm=True,
             ffn_glu=True,
             rms_norm=True,
-            rotary_dim=0,
+            rotary_dim=rotary_dim,
             rotary_interleave=False,
             rotary_scaling_type=rotary_scaling_type,
             rotary_scaling_factor=rotary_scaling_factor,
-            rotary_base=getattr(model.config, "rope_theta", 10000),
+            rotary_base=getattr(model.config, "rope_theta", None)
+            or rope_scaling.get("rope_theta", 10000),
             original_max_position_embeddings=original_max_position_embeddings,
             max_position_embeddings=max_position_embeddings,
             num_heads_kv=num_heads_kv,
@@ -3619,6 +3688,7 @@ class Phi3Loader(ModelLoader):
         config.bos_token = tokenizer.bos_token
         config.eos_token = tokenizer.eos_token
         config.unk_token = tokenizer.unk_token
+        config.layer_norm_epsilon = model.config.rms_norm_eps
 
     def set_layer_norm(self, spec, layer_norm):
         spec.gamma = layer_norm.weight
@@ -3635,6 +3705,7 @@ class Phi3Loader(ModelLoader):
 
     def set_decoder(self, spec, module, quant_type=common_spec.Quantization.CT2):
         spec.scale_embeddings = False
+        rope_scaling = getattr(module.config, "rope_scaling", None) or {}
         self.set_embeddings(spec.embeddings, module.embed_tokens)
         self.set_layer_norm(spec.layer_norm, module.norm)
 
@@ -3656,15 +3727,14 @@ class Phi3Loader(ModelLoader):
                 layer.self_attn.o_proj,
                 quant_type=quant_type,
             )
-            if (
-                layer.self_attn.rotary_emb.long_factor is not None
-                and layer.self_attn.rotary_emb.short_factor is not None
-            ):
-                self.set_rotary_embeddings(
-                    layer_spec.self_attention,
-                    layer.self_attn.rotary_emb.long_factor,
-                    layer.self_attn.rotary_emb.short_factor,
-                )
+            # The factors are on rotary_emb in older transformers, only in the config in newer ones.
+            rotary_emb = getattr(layer.self_attn, "rotary_emb", None)
+            factors = [
+                getattr(rotary_emb, name, rope_scaling.get(name))
+                for name in ("long_factor", "short_factor")
+            ]
+            if None not in factors:
+                self.set_rotary_embeddings(layer_spec.self_attention, *factors)
 
             # Handle gate_up_proj differently for AWQ vs regular models
             if quant_type == common_spec.Quantization.CT2:
@@ -3910,7 +3980,9 @@ class BertLoader(ModelLoader):
         return "BertModel"
 
     def get_model_spec(self, model):
-        assert model.config.position_embedding_type == "absolute"
+        assert (
+            getattr(model.config, "position_embedding_type", "absolute") == "absolute"
+        )
 
         encoder_spec = transformer_spec.TransformerEncoderSpec(
             model.config.num_hidden_layers,
@@ -3989,7 +4061,9 @@ class XLMRobertaLoader(ModelLoader):
         return "XLMRobertaForSequenceClassification"
 
     def get_model_spec(self, model):
-        assert model.config.position_embedding_type == "absolute"
+        assert (
+            getattr(model.config, "position_embedding_type", "absolute") == "absolute"
+        )
 
         encoder_spec = transformer_spec.TransformerEncoderSpec(
             model.config.num_hidden_layers,
@@ -4071,7 +4145,9 @@ class RobertaLoader(ModelLoader):
         return "RobertaModel"
 
     def get_model_spec(self, model):
-        assert model.config.position_embedding_type == "absolute"
+        assert (
+            getattr(model.config, "position_embedding_type", "absolute") == "absolute"
+        )
 
         encoder_spec = transformer_spec.TransformerEncoderSpec(
             model.config.num_hidden_layers,
@@ -4153,7 +4229,9 @@ class CamembertLoader(ModelLoader):
         return "CamembertModel"
 
     def get_model_spec(self, model):
-        assert model.config.position_embedding_type == "absolute"
+        assert (
+            getattr(model.config, "position_embedding_type", "absolute") == "absolute"
+        )
 
         encoder_spec = transformer_spec.TransformerEncoderSpec(
             model.config.num_hidden_layers,
@@ -4521,6 +4599,9 @@ class T5GemmaLoader(ModelLoader):
 
         # Tie_word_embeddings
         self.set_linear(spec.decoder.projection, model.model.decoder.embed_tokens)
+        final_softcap = getattr(decoder_config, "final_logit_softcapping", None)
+        if final_softcap is not None and final_softcap > 0:
+            spec.decoder.final_logit_softcapping = np.float32(final_softcap)
         return spec
 
     def set_vocabulary(self, spec, tokens):
